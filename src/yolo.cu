@@ -440,11 +440,15 @@ InstanceSegmentMap::~InstanceSegmentMap() {
 
 class InferImpl : public Infer {
  public:
-  shared_ptr<trt::Infer> trt_;
-  string engine_file_;
-  Type type_;
-  float confidence_threshold_;
-  float nms_threshold_;
+  shared_ptr<trt::Infer> trt_; // TensorRT 的推理类
+  string engine_file_; // 存储
+  Type type_; //模型类型
+  float confidence_threshold_; //目标检测的置信度
+  
+  
+  float nms_threshold_;  //非最大抑制阈值 
+
+
   vector<shared_ptr<trt::Memory<unsigned char>>> preprocess_buffers_;
   trt::Memory<float> input_buffer_, bbox_predict_, output_boxarray_;
   trt::Memory<float> segment_predict_;
