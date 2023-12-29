@@ -336,6 +336,22 @@ static void warp_affine_bilinear_and_normalize_plane(uint8_t *src, int src_line_
       matrix_2_3, norm));
 }
 
+//用于解码单个掩码（mask）
+/*
+什么叫解码单个掩码？
+
+解码单个掩码是指从模型的输出中还原出单个实例的掩码。
+在目标检测和实例分割任务中，模型通常会输出每个检测实例的信息，包括其边界框（Bounding Box）位置和对应的掩码。
+
+掩码是用于描述目标实例的像素级别的信息，通常用于实例分割任务。
+在深度学习模型中，这些掩码通常以概率图或二进制图的形式出现，用于指示图像中每个像素属于目标实例的概率或二进制状态。
+
+解码单个掩码的过程就是将模型输出的信息转换为可视化或应用所需的形式。
+在下面CUDA核函数中，
+解码的过程包括将预测的掩码与权重相乘并应用 Sigmoid 函数，
+最终将得到的值映射到 0 到 255 的范围，形成最终的可视化掩码。
+这个掩码可以用于可视化目标实例的位置和形状。
+*/
 static __global__ void decode_single_mask_kernel(int left, int top, float *mask_weights,
                                                  float *mask_predict, int mask_width,
                                                  int mask_height, unsigned char *mask_out,
@@ -444,39 +460,50 @@ class InferImpl : public Infer {
   string engine_file_; // 存储
   Type type_; //模型类型
   float confidence_threshold_; //目标检测的置信度
-  
-  
+  /*
+  非最大抑制技术：用于去除冗余检测结果。对所有检测结果按照置信度进行排序，并选择具有最高置信度的检测结果为最终输出
+  */
   float nms_threshold_;  //非最大抑制阈值 
 
-
-  vector<shared_ptr<trt::Memory<unsigned char>>> preprocess_buffers_;
-  trt::Memory<float> input_buffer_, bbox_predict_, output_boxarray_;
-  trt::Memory<float> segment_predict_;
-  int network_input_width_, network_input_height_;
-  Norm normalize_;
-  vector<int> bbox_head_dims_;
-  vector<int> segment_head_dims_;
-  int num_classes_ = 0;
-  bool has_segment_ = false;
-  bool isdynamic_model_ = false;
-  vector<shared_ptr<trt::Memory<unsigned char>>> box_segment_cache_;
+  vector<shared_ptr<trt::Memory<unsigned char>>> preprocess_buffers_; //预处理缓冲区集合
+  trt::Memory<float> input_buffer_, bbox_predict_, output_boxarray_; //存储GPU上的内存，分别存储 输入的图像数据 、 边界框的预测结果、推理工程中的输出信息
+  trt::Memory<float> segment_predict_;  //存储深度学习模型对分割的预测结果 
+  int network_input_width_, network_input_height_; //网络输入的宽度和高度
+  
+  /*
+  归一化：用于将输入数据按照一定规则进行缩放，使其具有特定的分布范围。有助于提高模型的训练稳定性和收敛速度
+  */
+  Norm normalize_;  //归一化参数
+  vector<int> bbox_head_dims_; //边界框头维度
+  vector<int> segment_head_dims_; //分割头维度
+  int num_classes_ = 0;  //类别数
+  bool has_segment_ = false; //标志是否具有分割头
+  bool isdynamic_model_ = false; //标志模型是否具有动态维度
+  vector<shared_ptr<trt::Memory<unsigned char>>> box_segment_cache_; //用于存储分割头缓存的集合
 
   virtual ~InferImpl() = default;
 
   void adjust_memory(int batch_size) {
     // the inference batch_size
     size_t input_numel = network_input_width_ * network_input_height_ * 3;
+    //为输入缓冲区分配GPU内存，大小为 batch_size * 网络宽度 * 网络高度 * 3
     input_buffer_.gpu(batch_size * input_numel);
+    //为边界框预测结果缓冲分配GPU内存
     bbox_predict_.gpu(batch_size * bbox_head_dims_[1] * bbox_head_dims_[2]);
+    // 为输出边界框数组缓冲区分配GPU内存
     output_boxarray_.gpu(batch_size * (32 + MAX_IMAGE_BOXES * NUM_BOX_ELEMENT));
+    // 为输出边界框数组缓冲区分配GPU内存
     output_boxarray_.cpu(batch_size * (32 + MAX_IMAGE_BOXES * NUM_BOX_ELEMENT));
 
-    if (has_segment_)
+    if (has_segment_) //如果模型有分割头
+      //为分割预测结果缓冲区分配GPU内存
       segment_predict_.gpu(batch_size * segment_head_dims_[1] * segment_head_dims_[2] *
                            segment_head_dims_[3]);
 
+    // 如果预处理缓冲区的数量小于 batch_size
     if ((int)preprocess_buffers_.size() < batch_size) {
       for (int i = preprocess_buffers_.size(); i < batch_size; ++i)
+        // 将缺少的预处理缓冲区添加到 preprocess_buffers_
         preprocess_buffers_.push_back(make_shared<trt::Memory<unsigned char>>());
     }
   }
@@ -484,22 +511,48 @@ class InferImpl : public Infer {
   void preprocess(int ibatch, const Image &image,
                   shared_ptr<trt::Memory<unsigned char>> preprocess_buffer, AffineMatrix &affine,
                   void *stream = nullptr) {
+
+    //计算仿射变换矩阵，将输入图像变换到模型期望的输入尺寸
+    /* 
+    仿射变换是一种线性变换，用于将二维平面上的图像进行平移、旋转、缩放和错切等操作。
+    在仿射变换中，原始图像上的平行线仍然保持平行，不同点之间的距离比例保持不变。
+    这种变换可以通过一个矩阵来表示，被称为仿射变换矩阵。
+    */
     affine.compute(make_tuple(image.width, image.height),
                    make_tuple(network_input_width_, network_input_height_));
 
     size_t input_numel = network_input_width_ * network_input_height_ * 3;
+
+    // 获取输入缓冲区的 GPU 指针，移动到当前 batch 的位置
     float *input_device = input_buffer_.gpu() + ibatch * input_numel;
+    // 计算图像数据的大小
     size_t size_image = image.width * image.height * 3;
+
+    // 计算仿射变换矩阵占用的空间大小，向上取整到 32 字节的倍数
     size_t size_matrix = upbound(sizeof(affine.d2i), 32);
+
+    // 在预处理缓冲区中获取 GPU 指针，用于存储仿射变换矩阵和图像数据
     uint8_t *gpu_workspace = preprocess_buffer->gpu(size_matrix + size_image);
+
+    // 获取仿射变换矩阵的 GPU 指针
     float *affine_matrix_device = (float *)gpu_workspace;
+
+    // 获取图像数据的 GPU 指针
     uint8_t *image_device = gpu_workspace + size_matrix;
 
+    // 在预处理缓冲区中获取 CPU 指针，用于存储仿射变换矩阵和图像数据的主机端数据
     uint8_t *cpu_workspace = preprocess_buffer->cpu(size_matrix + size_image);
+    
+    // 获取仿射变换矩阵的主机端指针
     float *affine_matrix_host = (float *)cpu_workspace;
+
+    // 获取图像数据的主机端指针
     uint8_t *image_host = cpu_workspace + size_matrix;
 
     // speed up
+    // 将输入图像数据和仿射变换矩阵数据从主机端复制到 GPU 端
+    // 这里使用异步的方式进行数据传输，加速处理过程
+    // 注意：这里使用了 CUDA 的 memcpy 函数和 cudaMemcpyAsync 函数
     cudaStream_t stream_ = (cudaStream_t)stream;
     memcpy(image_host, image.bgrptr, size_image);
     memcpy(affine_matrix_host, affine.d2i, sizeof(affine.d2i));
@@ -508,6 +561,13 @@ class InferImpl : public Infer {
     checkRuntime(cudaMemcpyAsync(affine_matrix_device, affine_matrix_host, sizeof(affine.d2i),
                                  cudaMemcpyHostToDevice, stream_));
 
+    // 执行仿射变换、双线性插值和归一化操作
+    // 这是对输入图像进行预处理的关键步骤
+    /*
+    双线性插值是一种在离散的数据点之间估算数值的方法，通常用于图像处理中的缩放和变换操作。
+    在图像处理中，经常需要在图像的像素之间进行插值以获得非整数坐标处的像素值。
+    双线性插值是一种简单而有效的插值方法，它利用了图像中相邻像素之间的局部线性关系
+    */
     warp_affine_bilinear_and_normalize_plane(image_device, image.width * 3, image.width,
                                              image.height, input_device, network_input_width_,
                                              network_input_height_, affine_matrix_device, 114,
@@ -566,11 +626,23 @@ class InferImpl : public Infer {
     int num_image = images.size();
     if (num_image == 0) return {};
 
+    /*
+    获取模型输入的各个维度的大小。通畅包括
+    1. 批处理大小（batch size）
+    2. 通道数
+    3. 图像高度
+    4. 图像宽度
+    */
     auto input_dims = trt_->static_dims(0);
+
+    /*
+    获取推断批处理大小
+    批处理大小是指在模型训练或推理中一次输入给模型的样本数量。
+    */
     int infer_batch_size = input_dims[0];
-    if (infer_batch_size != num_image) {
-      if (isdynamic_model_) {
-        infer_batch_size = num_image;
+    if (infer_batch_size != num_image) { //批处理大小与输入图像数量不相等
+      if (isdynamic_model_) { //模型为动态形状，允许在推理时更改输入的批处理大小
+        infer_batch_size = num_image; 
         input_dims[0] = num_image;
         if (!trt_->set_run_dims(0, input_dims)) return {};
       } else {
@@ -583,11 +655,13 @@ class InferImpl : public Infer {
         }
       }
     }
+    //根据批处理大小，调整内存空间
     adjust_memory(infer_batch_size);
 
     vector<AffineMatrix> affine_matrixs(num_image);
     cudaStream_t stream_ = (cudaStream_t)stream;
     for (int i = 0; i < num_image; ++i)
+      //进行仿射变换都操作，同时在CPU和GPU内存之间进行数据搬运
       preprocess(i, images[i], preprocess_buffers_[i], affine_matrixs[i], stream);
 
     float *bbox_output_device = bbox_predict_.gpu();
