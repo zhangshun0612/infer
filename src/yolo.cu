@@ -409,14 +409,37 @@ const char *type_name(Type type) {
   }
 }
 
-struct AffineMatrix {
-  float i2d[6];  // image to dst(network), 2x3 matrix
-  float d2i[6];  // dst to image, 2x3 matrix
+/*
+仿射变换矩阵每个元素的含义
+| a   b   c |
+| d   e   f |
 
+其中：
+a 和 e 控制水平和垂直方向的缩放变换
+b 和 d 控制水平和垂直方向的切变 （shear）变换 （切变变换是指在平行于坐标轴的方向上进行的拉伸或挤压操作）
+c 和 f 控制水平和垂直方向的平移变换
+
+对于二维平面上的点 （x, y）经过仿射变换后的新坐标(x', y') 的计算方法：
+x' = ax + by + c
+y' = dx + ey + f
+
+*/
+
+struct AffineMatrix {
+  float i2d[6];  // image to dst(network), 2x3 matrix 表示图像到目标网络的仿射变换矩阵
+  float d2i[6];  // dst to image, 2x3 matrix  表示目标网络到图像的仿射变换矩阵
+
+  /*
+  参数 from： 表示原图像的尺寸
+  参数 to：   表示目标网络的尺寸
+  该函数用来计算 i2d 和 d2i
+  */
   void compute(const std::tuple<int, int> &from, const std::tuple<int, int> &to) {
+    //计算缩放比例，使得目标尺寸使用源图像尺寸
     float scale_x = get<0>(to) / (float)get<0>(from);
     float scale_y = get<1>(to) / (float)get<1>(from);
     float scale = std::min(scale_x, scale_y);
+
     i2d[0] = scale;
     i2d[1] = 0;
     i2d[2] = -scale * get<0>(from) * 0.5 + get<0>(to) * 0.5 + scale * 0.5 - 0.5;
@@ -424,6 +447,7 @@ struct AffineMatrix {
     i2d[4] = scale;
     i2d[5] = -scale * get<1>(from) * 0.5 + get<1>(to) * 0.5 + scale * 0.5 - 0.5;
 
+    //计算目标到图像的仿射变换矩阵
     double D = i2d[0] * i2d[4] - i2d[1] * i2d[3];
     D = D != 0. ? double(1.) / D : double(0.);
     double A11 = i2d[4] * D, A22 = i2d[0] * D, A12 = -i2d[1] * D, A21 = -i2d[3] * D;

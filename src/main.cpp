@@ -71,21 +71,29 @@ void perf() {
 void batch_inference() {
   std::vector<cv::Mat> images{cv::imread("inference/car.jpg"), cv::imread("inference/gril.jpg"),
                               cv::imread("inference/group.jpg")};
+  //加载yolo模型
   auto yolo = yolo::load("yolov8n.transd.engine", yolo::Type::V8);
   if (yolo == nullptr) return;
 
+  //将OpenCV的图像转换成 YOLO的图像对象
   std::vector<yolo::Image> yoloimages(images.size());
   std::transform(images.begin(), images.end(), yoloimages.begin(), cvimg);
+
+  //此处进行批量推理
   auto batched_result = yolo->forwards(yoloimages);
   for (int ib = 0; ib < (int)batched_result.size(); ++ib) {
     auto &objs = batched_result[ib];
     auto &image = images[ib];
+    //遍历每个检测到的对象
     for (auto &obj : objs) {
+
+      //随机选择一个颜色，并在图像上绘制矩形框
       uint8_t b, g, r;
       tie(b, g, r) = yolo::random_color(obj.class_label);
       cv::rectangle(image, cv::Point(obj.left, obj.top), cv::Point(obj.right, obj.bottom),
                     cv::Scalar(b, g, r), 5);
 
+      //在图像上绘制类别和置信度信息
       auto name = cocolabels[obj.class_label];
       auto caption = cv::format("%s %.2f", name, obj.confidence);
       int width = cv::getTextSize(caption, 0, 1, 2, nullptr).width + 10;
@@ -95,6 +103,7 @@ void batch_inference() {
                   16);
     }
     printf("Save result to Result.jpg, %d objects\n", (int)objs.size());
+    //保存结果图片
     cv::imwrite(cv::format("Result%d.jpg", ib), image);
   }
 }
